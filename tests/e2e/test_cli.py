@@ -11,7 +11,19 @@ import pytest
 from whisper_transcribe.__main__ import EXIT_BAD_USAGE, EXIT_FAILURES, EXIT_OK, main
 
 CANNED_VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello world.\n"
-FAKE_WAV = b"RIFF\x00\x00\x00\x00WAVEdata\x00\x00\x00\x00"
+# Minimal 44-byte WAV that passes _finalize_wav validation (RIFF/WAVE + fmt + data chunk).
+FAKE_WAV = (
+    b"RIFF" + b"\x00\x00\x00\x00"       # RIFF header
+    + b"WAVE"                             # WAVE marker
+    + b"fmt " + b"\x10\x00\x00\x00"     # fmt chunk (16 bytes)
+    + b"\x01\x00"                        # PCM
+    + b"\x01\x00"                        # mono
+    + b"\x80\x3e\x00\x00"               # 16000 Hz
+    + b"\x00\x7d\x00\x00"               # byte rate
+    + b"\x02\x00"                        # block align
+    + b"\x10\x00"                        # 16-bit
+    + b"data" + b"\x00\x00\x00\x00"     # data chunk
+)
 
 
 @pytest.fixture()
@@ -31,9 +43,10 @@ def _mock_server(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
         return httpx.Response(200, text=CANNED_VTT)
 
+    _RealClient = httpx.Client  # capture before patching to avoid infinite recursion
     monkeypatch.setattr(
         "whisper_transcribe.client.httpx.Client",
-        lambda **_kw: httpx.Client(transport=httpx.MockTransport(handler)),
+        lambda **_kw: _RealClient(transport=httpx.MockTransport(handler)),
     )
 
 
