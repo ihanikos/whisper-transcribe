@@ -9,6 +9,7 @@ description = "Batch-transcribe mp3 files via a local whisper.cpp server"
 requires-python = ">=3.12"
 license = { text = "Proprietary" }
 dependencies = [
+    "av>=14.0.0",
     "httpx>=0.28.1",
     "rich>=14.2.0",
     "structlog>=25.5.0",
@@ -50,6 +51,19 @@ select = ["ALL"]
 ignore = [
     "D203",  # conflicts with D211
     "D213",  # conflicts with D212
+    "COM812",  # conflicts with ruff format (trailing commas are formatter's job)
+    # CPY001: license header policy is undecided — LICENSE (GPL-3) conflicts
+    # with pyproject `license = "Proprietary"`. Decide one, then add headers.
+    "CPY001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+    "S101",    # assert is the pytest assertion mechanism
+    "PLR2004", # arbitrary fixture values
+    "PT001",   # @pytest.fixture() style
+    "PT019",   # fixtures injected as parameters for ordering
+    "D104",    # package docstrings
 ]
 
 [tool.mypy]
