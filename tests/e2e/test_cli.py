@@ -2,38 +2,18 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-from unittest.mock import MagicMock
+from typing import TYPE_CHECKING
 
 import httpx
 import pytest
 
+from tests.mp3gen import write_mp3
 from whisper_transcribe.__main__ import EXIT_BAD_USAGE, EXIT_FAILURES, EXIT_OK, main
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 CANNED_VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello world.\n"
-# Minimal 44-byte WAV that passes _finalize_wav validation (RIFF/WAVE + fmt + data chunk).
-FAKE_WAV = (
-    b"RIFF" + b"\x00\x00\x00\x00"       # RIFF header
-    + b"WAVE"                             # WAVE marker
-    + b"fmt " + b"\x10\x00\x00\x00"     # fmt chunk (16 bytes)
-    + b"\x01\x00"                        # PCM
-    + b"\x01\x00"                        # mono
-    + b"\x80\x3e\x00\x00"               # 16000 Hz
-    + b"\x00\x7d\x00\x00"               # byte rate
-    + b"\x02\x00"                        # block align
-    + b"\x10\x00"                        # 16-bit
-    + b"data" + b"\x00\x00\x00\x00"     # data chunk
-)
-
-
-@pytest.fixture()
-def _mock_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub ffmpeg so CLI tests do not need a real ffmpeg binary."""
-    monkeypatch.setattr("whisper_transcribe.audio.shutil.which", lambda _: "/usr/bin/ffmpeg")
-    proc = MagicMock()
-    proc.returncode = 0
-    proc.stdout = FAKE_WAV
-    monkeypatch.setattr("whisper_transcribe.audio.subprocess.run", lambda *_a, **_kw: proc)
 
 
 @pytest.fixture()
@@ -43,21 +23,20 @@ def _mock_server(monkeypatch: pytest.MonkeyPatch) -> None:
     def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
         return httpx.Response(200, text=CANNED_VTT)
 
-    _RealClient = httpx.Client  # capture before patching to avoid infinite recursion
+    # capture the real class before patching to avoid infinite recursion
+    real_client = httpx.Client
     monkeypatch.setattr(
         "whisper_transcribe.client.httpx.Client",
-        lambda **_kw: _RealClient(transport=httpx.MockTransport(handler)),
+        lambda **_kw: real_client(transport=httpx.MockTransport(handler)),
     )
 
 
 def test_cli_transcribes_mp3_and_exits_zero(
     tmp_path: Path,
-    _mock_ffmpeg: None,
     _mock_server: None,
 ) -> None:
     """CLI writes a VTT file and exits 0 when transcription succeeds."""
-    mp3 = tmp_path / "audio.mp3"
-    mp3.touch()
+    write_mp3(tmp_path / "audio.mp3", [(1.0, False)])
     code = main([str(tmp_path)])
     assert code == EXIT_OK
     assert (tmp_path / "audio.vtt").read_text() == CANNED_VTT
@@ -75,31 +54,19 @@ def test_cli_reports_no_mp3s_and_exits_zero(tmp_path: Path) -> None:
     assert code == EXIT_OK
 
 
-def test_cli_exits_one_when_a_file_fails(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """CLI exits EXIT_FAILURES when at least one file fails to transcribe."""
-    monkeypatch.setattr("whisper_transcribe.audio.shutil.which", lambda _: "/usr/bin/ffmpeg")
-    proc = MagicMock()
-    proc.returncode = 1
-    proc.stderr = b"decode error"
-    monkeypatch.setattr("whisper_transcribe.audio.subprocess.run", lambda *_a, **_kw: proc)
-
-    mp3 = tmp_path / "audio.mp3"
-    mp3.touch()
+def test_cli_exits_one_when_a_file_fails(tmp_path: Path, _mock_server: None) -> None:
+    """CLI exits EXIT_FAILURES when an mp3 cannot be decoded."""
+    (tmp_path / "audio.mp3").write_bytes(b"not an mp3")
     code = main([str(tmp_path)])
     assert code == EXIT_FAILURES
 
 
 def test_cli_skips_existing_transcripts_by_default(
     tmp_path: Path,
-    _mock_ffmpeg: None,
     _mock_server: None,
 ) -> None:
     """CLI leaves existing transcripts untouched without --overwrite."""
-    mp3 = tmp_path / "audio.mp3"
-    mp3.touch()
+    write_mp3(tmp_path / "audio.mp3", [(1.0, False)])
     vtt = tmp_path / "audio.vtt"
     vtt.write_text("existing content")
     main([str(tmp_path)])

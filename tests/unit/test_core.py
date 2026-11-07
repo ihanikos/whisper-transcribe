@@ -1,8 +1,9 @@
-"""Tests for batch transcription orchestration."""
+"""Tests for batch transcription orchestration and chunk merging."""
 
 from __future__ import annotations
 
-from pathlib import Path
+import json
+from typing import TYPE_CHECKING
 
 import pytest
 import structlog.testing
@@ -10,15 +11,19 @@ import structlog.testing
 from whisper_transcribe.audio import AudioConversionError
 from whisper_transcribe.client import TranscriptionError
 from whisper_transcribe.core import (
-    FileResult,
     TranscribeOptions,
     find_mp3s,
+    merge_transcripts,
     transcribe_directory,
     transcribe_file,
     transcript_path,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 CANNED_VTT = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nHello world.\n"
+CHUNK_VTT = "WEBVTT\n\n00:00:10.000 --> 00:00:11.000\nchunk text.\n"
 
 
 class FakeClient:
@@ -31,7 +36,31 @@ class FakeClient:
         response_format: str = "vtt",  # noqa: ARG002
         temperature: float = 0.0,  # noqa: ARG002
     ) -> str:
+        """Return the canned VTT string."""
         return CANNED_VTT
+
+
+class ChunkVTTClient:
+    """Stub transcriber that returns the same chunk-relative VTT per call."""
+
+    def __init__(self, *, calls: int | None = None) -> None:
+        """Count calls; raise TranscriptionError after ``calls`` successful ones."""
+        self.calls = 0
+        self.max_calls = calls
+
+    def transcribe(
+        self,
+        audio: bytes,  # noqa: ARG002
+        *,
+        response_format: str = "vtt",  # noqa: ARG002
+        temperature: float = 0.0,  # noqa: ARG002
+    ) -> str:
+        """Return CHUNK_VTT, or raise once the call budget is spent."""
+        self.calls += 1
+        if self.max_calls is not None and self.calls > self.max_calls:
+            msg = "server unreachable"
+            raise TranscriptionError(msg)
+        return CHUNK_VTT
 
 
 class FailingClient:
@@ -44,13 +73,24 @@ class FailingClient:
         response_format: str = "vtt",  # noqa: ARG002
         temperature: float = 0.0,  # noqa: ARG002
     ) -> str:
+        """Raise TranscriptionError on every call."""
         msg = "server unreachable"
         raise TranscriptionError(msg)
 
 
-def _fake_decode(path: Path) -> bytes:  # noqa: ARG001
-    """Return minimal fake WAV bytes without calling ffmpeg."""
+def _fake_decode(path: Path, *, start: float = 0.0, end: float | None = None) -> bytes:  # noqa: ARG001
+    """Return minimal fake WAV bytes without decoding audio."""
     return b"RIFF\x00\x00\x00\x00WAVEdata\x00\x00\x00\x00"
+
+
+@pytest.fixture()
+def _short_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch audio probing so every file needs a single chunk."""
+    monkeypatch.setattr(
+        "whisper_transcribe.core.probe_duration_seconds",
+        lambda _p: 1.0,
+    )
+    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
 
 
 def test_find_mp3s_returns_sorted_list(tmp_path: Path) -> None:
@@ -89,14 +129,13 @@ def test_transcript_path_uses_correct_extension(tmp_path: Path) -> None:
 
 
 def test_transcribe_file_writes_only_the_transcript(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    _short_file: None,
+    tmp_path: Path,
 ) -> None:
     """transcribe_file writes the transcript and no other files."""
-    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
     mp3 = tmp_path / "audio.mp3"
     mp3.touch()
-    options = TranscribeOptions()
-    result = transcribe_file(mp3, FakeClient(), options)
+    result = transcribe_file(mp3, FakeClient(), TranscribeOptions())
     files_written = list(tmp_path.iterdir())
     assert result.status == "written"
     assert result.output.suffix == ".vtt"
@@ -105,10 +144,10 @@ def test_transcribe_file_writes_only_the_transcript(
 
 
 def test_transcribe_file_skips_existing_output(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    _short_file: None,
+    tmp_path: Path,
 ) -> None:
     """transcribe_file skips a file whose transcript already exists."""
-    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
     mp3 = tmp_path / "audio.mp3"
     mp3.touch()
     vtt = tmp_path / "audio.vtt"
@@ -119,10 +158,10 @@ def test_transcribe_file_skips_existing_output(
 
 
 def test_transcribe_file_overwrites_when_flag_set(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    _short_file: None,
+    tmp_path: Path,
 ) -> None:
     """transcribe_file replaces an existing transcript when overwrite=True."""
-    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
     mp3 = tmp_path / "audio.mp3"
     mp3.touch()
     vtt = tmp_path / "audio.vtt"
@@ -132,11 +171,60 @@ def test_transcribe_file_overwrites_when_flag_set(
     assert vtt.read_text() == CANNED_VTT
 
 
+def test_transcribe_file_merges_chunks_with_shifted_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Chunk responses are merged with timestamps shifted by chunk start."""
+    monkeypatch.setattr(
+        "whisper_transcribe.core.probe_duration_seconds",
+        lambda _p: 620.0,
+    )
+    monkeypatch.setattr(
+        "whisper_transcribe.core.plan_chunks",
+        lambda _p, _d: [(0.0, 300.0), (300.0, 620.0)],
+    )
+    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
+    mp3 = tmp_path / "long.mp3"
+    mp3.touch()
+    client = ChunkVTTClient()
+    result = transcribe_file(mp3, client, TranscribeOptions())
+    assert client.calls == 2
+    assert result.status == "written"
+    assert result.output.read_text() == (
+        "WEBVTT\n\n"
+        "00:00:10.000 --> 00:00:11.000\nchunk text.\n\n"
+        "00:05:10.000 --> 00:05:11.000\nchunk text.\n"
+    )
+
+
+def test_transcribe_file_failure_mid_chunks_leaves_no_output(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A chunk failure fails the file and writes no partial transcript."""
+    monkeypatch.setattr(
+        "whisper_transcribe.core.probe_duration_seconds",
+        lambda _p: 620.0,
+    )
+    monkeypatch.setattr(
+        "whisper_transcribe.core.plan_chunks",
+        lambda _p, _d: [(0.0, 300.0), (300.0, 620.0)],
+    )
+    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
+    mp3 = tmp_path / "long.mp3"
+    mp3.touch()
+    client = ChunkVTTClient(calls=1)
+    with pytest.raises(TranscriptionError):
+        transcribe_file(mp3, client, TranscribeOptions())
+    assert not (tmp_path / "long.vtt").exists()
+
+
 def test_transcribe_directory_continues_after_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    _short_file: None,
+    tmp_path: Path,
 ) -> None:
     """transcribe_directory marks failures and processes remaining files."""
-    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
     (tmp_path / "a.mp3").touch()
     (tmp_path / "b.mp3").touch()
     results = transcribe_directory(tmp_path, FailingClient(), TranscribeOptions())
@@ -145,10 +233,10 @@ def test_transcribe_directory_continues_after_failure(
 
 
 def test_transcribe_directory_logs_start_and_duration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    _short_file: None,
+    tmp_path: Path,
 ) -> None:
     """transcribe_directory emits batch_started and file_processed log events."""
-    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _fake_decode)
     mp3 = tmp_path / "audio.mp3"
     mp3.touch()
     with structlog.testing.capture_logs() as logs:
@@ -158,3 +246,77 @@ def test_transcribe_directory_logs_start_and_duration(
     processed = [e for e in logs if e["event"] == "file_processed"]
     assert len(processed) == 1
     assert "elapsed_seconds" in processed[0]
+
+
+def test_merge_transcripts_single_part_is_verbatim() -> None:
+    """A single chunk response is returned unchanged."""
+    assert merge_transcripts([CANNED_VTT], [0.0], "vtt") == CANNED_VTT
+
+
+def test_merge_transcripts_srt_shifts_and_renumbers() -> None:
+    """Srt chunks get shifted timestamps and unique cue numbers."""
+    part = "1\n00:00:10,000 --> 00:00:11,000\ntext\n"
+    merged = merge_transcripts([part, part], [0.0, 60.0], "srt")
+    assert merged == (
+        "1\n00:00:10,000 --> 00:00:11,000\ntext\n\n"
+        "2\n00:01:10,000 --> 00:01:11,000\ntext\n"
+    )
+
+
+def test_merge_transcripts_text_joins_lines() -> None:
+    """Text chunks are joined with newlines."""
+    merged = merge_transcripts(["first", "second"], [0.0, 300.0], "text")
+    assert merged == "first\nsecond\n"
+
+
+def test_merge_transcripts_json_shifts_segments() -> None:
+    """Json chunk segments are shifted and concatenated."""
+    first = '{"text": "hello", "segments": [{"start": 10.0, "end": 11.0}]}'
+    second = '{"text": "world", "segments": [{"start": 5.0, "end": 6.0}]}'
+    merged = json.loads(merge_transcripts([first, second], [0.0, 300.0], "json"))
+    assert merged["text"] == "hello world"
+    assert merged["segments"] == [
+        {"start": 10.0, "end": 11.0},
+        {"start": 305.0, "end": 306.0},
+    ]
+
+
+def test_merge_transcripts_verbose_json_shifts_offsets() -> None:
+    """verbose_json offsets (ms) and timestamps (clock) are shifted."""
+    first = (
+        '{"transcription": [{"offsets": {"from": 0, "to": 1000},'
+        ' "timestamps": {"from": "00:00:00.000", "to": "00:00:01.000"},'
+        ' "text": "a"}]}'
+    )
+    second = (
+        '{"transcription": [{"offsets": {"from": 500, "to": 1500},'
+        ' "timestamps": {"from": "00:00:00.500", "to": "00:00:01.500"},'
+        ' "text": "b"}]}'
+    )
+    merged = json.loads(merge_transcripts([first, second], [0.0, 60.0], "verbose_json"))
+    second_entry = merged["transcription"][1]
+    assert second_entry["offsets"] == {"from": 60500, "to": 61500}
+    assert second_entry["timestamps"] == {
+        "from": "00:01:00.500",
+        "to": "00:01:01.500",
+    }
+
+
+def test_transcribe_directory_records_conversion_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An audio conversion failure is recorded as a failed result."""
+    monkeypatch.setattr(
+        "whisper_transcribe.core.probe_duration_seconds",
+        lambda _p: 1.0,
+    )
+
+    def _boom(path: Path, *, start: float = 0.0, end: float | None = None) -> bytes:  # noqa: ARG001
+        msg = "cannot decode"
+        raise AudioConversionError(msg)
+
+    monkeypatch.setattr("whisper_transcribe.core.decode_to_wav_bytes", _boom)
+    (tmp_path / "a.mp3").touch()
+    results = transcribe_directory(tmp_path, FakeClient(), TranscribeOptions())
+    assert results[0].status == "failed"

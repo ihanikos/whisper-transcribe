@@ -38,10 +38,11 @@ def test_transcribe_raises_on_non_200() -> None:
 
 
 def test_transcribe_raises_on_connection_error() -> None:
-    """WhisperClient.transcribe raises TranscriptionError when the server is unreachable."""
+    """WhisperClient.transcribe raises TranscriptionError when server is down."""
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        raise httpx.ConnectError("connection refused")
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        msg = "connection refused"
+        raise httpx.ConnectError(msg)
 
     client = _make_client(httpx.MockTransport(handler))
     with pytest.raises(TranscriptionError, match="failed"):
@@ -54,7 +55,8 @@ def test_client_context_manager_closes_on_exit() -> None:
     def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
         return httpx.Response(200, text=CANNED_VTT)
 
-    with WhisperClient(client=httpx.Client(transport=httpx.MockTransport(handler))) as client:
+    transport = httpx.MockTransport(handler)
+    with WhisperClient(client=httpx.Client(transport=transport)) as client:
         result = client.transcribe(FAKE_WAV)
     assert result == CANNED_VTT
 

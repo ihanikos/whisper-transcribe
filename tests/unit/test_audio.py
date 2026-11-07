@@ -1,112 +1,98 @@
-"""Tests for audio decoding via ffmpeg streaming."""
+"""Tests for in-memory decoding and silence-aligned chunking via PyAV."""
 
 from __future__ import annotations
 
 import struct
-import subprocess
-from pathlib import Path
-from unittest.mock import MagicMock
+from typing import TYPE_CHECKING
 
 import pytest
 
+from tests.mp3gen import write_mp3
 from whisper_transcribe.audio import (
+    WHISPER_SAMPLE_RATE,
     AudioConversionError,
-    _WAV_HEADER_SIZE,
     decode_to_wav_bytes,
-    _finalize_wav,
+    plan_chunks,
+    probe_duration_seconds,
 )
 
+if TYPE_CHECKING:
+    from pathlib import Path
 
-def _make_wav_bytes(*, data: bytes = b"\x00" * 32, zeroed_sizes: bool = False) -> bytes:
-    """Build a minimal but valid PCM WAV byte string."""
-    fmt_chunk = (
-        b"fmt "
-        + struct.pack("<I", 16)    # chunk size
-        + struct.pack("<H", 1)     # PCM
-        + struct.pack("<H", 1)     # mono
-        + struct.pack("<I", 16000) # sample rate
-        + struct.pack("<I", 32000) # byte rate
-        + struct.pack("<H", 2)     # block align
-        + struct.pack("<H", 16)    # bits per sample
-    )
-    data_chunk = b"data" + struct.pack("<I", 0 if zeroed_sizes else len(data)) + data
-    body = fmt_chunk + data_chunk
-    riff_size = 0 if zeroed_sizes else (4 + len(body))
-    return b"RIFF" + struct.pack("<I", riff_size) + b"WAVE" + body
+# mp3 frames add ~0.15 s of slop at encode/seek boundaries.
+SLOP_SECONDS = 0.15
+BYTES_PER_SECOND = WHISPER_SAMPLE_RATE * 2
 
 
-def test_decode_to_wav_bytes_calls_ffmpeg(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """decode_to_wav_bytes invokes ffmpeg with the correct arguments."""
-    fake_wav = _make_wav_bytes()
-    monkeypatch.setattr("whisper_transcribe.audio.shutil.which", lambda _: "/usr/bin/ffmpeg")
-    result = MagicMock()
-    result.returncode = 0
-    result.stdout = fake_wav
-    monkeypatch.setattr(
-        "whisper_transcribe.audio.subprocess.run",
-        lambda cmd, **_kw: result,
-    )
-    mp3 = tmp_path / "test.mp3"
-    mp3.touch()
-    wav = decode_to_wav_bytes(mp3)
+@pytest.fixture()
+def mixed_mp3(tmp_path: Path) -> Path:
+    """Provide a 6 s mp3 made of 3 s tone followed by 3 s silence."""
+    path = tmp_path / "mixed.mp3"
+    write_mp3(path, [(3.0, False), (3.0, True)])
+    return path
+
+
+def test_probe_duration_matches_written_audio(mixed_mp3: Path) -> None:
+    """probe_duration_seconds returns the duration the file was written with."""
+    duration = probe_duration_seconds(mixed_mp3)
+    assert duration is not None
+    assert abs(duration - 6.0) < SLOP_SECONDS
+
+
+def test_decode_whole_file_returns_valid_wav(mixed_mp3: Path) -> None:
+    """decode_to_wav_bytes returns a 16 kHz mono s16 WAV of the full file."""
+    wav = decode_to_wav_bytes(mixed_mp3)
     assert wav[:4] == b"RIFF"
     assert wav[8:12] == b"WAVE"
+    assert struct.unpack_from("<I", wav, 4)[0] == len(wav) - 8
+    assert struct.unpack_from("<H", wav, 22)[0] == 1  # mono
+    assert struct.unpack_from("<I", wav, 24)[0] == WHISPER_SAMPLE_RATE
+    assert struct.unpack_from("<H", wav, 34)[0] == 16  # bits per sample
+    data_size = struct.unpack_from("<I", wav, 40)[0]
+    assert data_size == len(wav) - 44
+    assert abs(data_size - 6 * BYTES_PER_SECOND) < SLOP_SECONDS * BYTES_PER_SECOND
 
 
-def test_decode_to_wav_bytes_raises_when_ffmpeg_missing(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """decode_to_wav_bytes raises AudioConversionError when ffmpeg is not on PATH."""
-    monkeypatch.setattr("whisper_transcribe.audio.shutil.which", lambda _: None)
-    mp3 = tmp_path / "test.mp3"
-    mp3.touch()
-    with pytest.raises(AudioConversionError, match="ffmpeg was not found"):
-        decode_to_wav_bytes(mp3)
+def test_decode_window_returns_requested_range(mixed_mp3: Path) -> None:
+    """decode_to_wav_bytes decodes only [start, end) seconds."""
+    wav = decode_to_wav_bytes(mixed_mp3, start=1.0, end=3.0)
+    data_size = struct.unpack_from("<I", wav, 40)[0]
+    assert abs(data_size - 2 * BYTES_PER_SECOND) < SLOP_SECONDS * BYTES_PER_SECOND
 
 
-def test_decode_to_wav_bytes_raises_on_ffmpeg_failure(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """decode_to_wav_bytes raises AudioConversionError when ffmpeg exits non-zero."""
-    monkeypatch.setattr("whisper_transcribe.audio.shutil.which", lambda _: "/usr/bin/ffmpeg")
-    result = MagicMock()
-    result.returncode = 1
-    result.stderr = b"error: no such file"
-    monkeypatch.setattr(
-        "whisper_transcribe.audio.subprocess.run",
-        lambda cmd, **_kw: result,
-    )
-    mp3 = tmp_path / "test.mp3"
-    mp3.touch()
-    with pytest.raises(AudioConversionError, match="ffmpeg failed"):
-        decode_to_wav_bytes(mp3)
+def test_decode_raises_for_non_audio_file(tmp_path: Path) -> None:
+    """decode_to_wav_bytes raises AudioConversionError for undecodable input."""
+    path = tmp_path / "broken.mp3"
+    path.write_bytes(b"this is not audio")
+    with pytest.raises(AudioConversionError):
+        decode_to_wav_bytes(path)
 
 
-def test_finalize_wav_repairs_zeroed_chunk_sizes(tmp_path: Path) -> None:
-    """_finalize_wav corrects placeholder chunk sizes from piped ffmpeg output."""
-    source = tmp_path / "audio.wav"
-    data_payload = b"\x00" * 64
-    zeroed = _make_wav_bytes(data=data_payload, zeroed_sizes=True)
-    fixed = _finalize_wav(zeroed, source)
-    riff_size = struct.unpack_from("<I", fixed, 4)[0]
-    assert riff_size == len(fixed) - 8
+def test_plan_chunks_snaps_boundary_to_silence(tmp_path: Path) -> None:
+    """plan_chunks moves a grid boundary onto the nearest silent window."""
+    path = tmp_path / "gap.mp3"
+    duration = write_mp3(path, [(5.0, False), (4.0, True), (5.0, False)])
+    chunks = plan_chunks(path, duration, chunk_seconds=6.0, tolerance=3.0)
+    assert len(chunks) == 2
+    boundary = chunks[0][1]
+    assert boundary == pytest.approx(chunks[1][0])
+    # Silence runs 5..9 s; the midpoint nearest the 6 s grid point wins.
+    assert 5.5 < boundary < 6.5
 
 
-def test_finalize_wav_raises_on_invalid_header(tmp_path: Path) -> None:
-    """_finalize_wav raises AudioConversionError on non-WAV data."""
-    source = tmp_path / "audio.wav"
-    with pytest.raises(AudioConversionError, match="invalid WAV"):
-        _finalize_wav(b"INVALID" + b"\x00" * 40, source)
+def test_plan_chunks_falls_back_to_grid_without_silence(tmp_path: Path) -> None:
+    """plan_chunks keeps the grid point when no silence is nearby."""
+    path = tmp_path / "tone.mp3"
+    duration = write_mp3(path, [(12.0, False)])
+    chunks = plan_chunks(path, duration, chunk_seconds=5.0, tolerance=2.0)
+    assert chunks[0] == (0.0, 5.0)
+    assert chunks[1] == (5.0, duration)
 
 
-def test_finalize_wav_raises_when_data_chunk_missing(tmp_path: Path) -> None:
-    """_finalize_wav raises AudioConversionError when there is no data chunk."""
-    source = tmp_path / "audio.wav"
-    # Valid RIFF/WAVE header but no "data" sub-chunk
-    buf = bytearray(44)
-    buf[0:4] = b"RIFF"
-    buf[4:8] = struct.pack("<I", 36)
-    buf[8:12] = b"WAVE"
-    buf[12:16] = b"fmt "
-    with pytest.raises(AudioConversionError, match="no data chunk"):
-        _finalize_wav(bytes(buf), source)
+def test_plan_chunks_single_chunk_for_short_file(tmp_path: Path) -> None:
+    """plan_chunks returns one span covering the file when no boundary fits."""
+    path = tmp_path / "short.mp3"
+    duration = write_mp3(path, [(10.0, False)])
+    chunks = plan_chunks(path, duration)
+    assert len(chunks) == 1
+    assert chunks[0] == (0.0, duration)
