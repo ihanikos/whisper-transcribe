@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import logging
 import sys
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from whisper_transcribe.core import (
     TranscribeOptions,
     transcribe_directory,
 )
+from whisper_transcribe.logging_config import configure_logging, get_log_file_path
 
 console = Console()
 err_console = Console(stderr=True)
@@ -25,16 +25,6 @@ err_console = Console(stderr=True)
 EXIT_OK = 0
 EXIT_FAILURES = 1
 EXIT_BAD_USAGE = 2
-
-
-def _configure_logging(*, verbose: bool) -> None:
-    """Route structlog output to stderr at INFO, or DEBUG when verbose."""
-    structlog.configure(
-        wrapper_class=structlog.make_filtering_bound_logger(
-            logging.DEBUG if verbose else logging.INFO,
-        ),
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
-    )
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -45,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "Transcribe every .mp3 in a directory via a local whisper.cpp "
             "server, writing one transcript per file."
         ),
+        epilog=f"Execution log: {get_log_file_path()}",
     )
     parser.add_argument(
         "directory",
@@ -120,10 +111,19 @@ def _render_summary(results: list[FileResult]) -> None:
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     args = _build_parser().parse_args(argv)
-    _configure_logging(verbose=args.verbose)
+    log_file_error = configure_logging(verbose=args.verbose)
+    if log_file_error is not None:
+        err_console.print(
+            f"[yellow]warning:[/] could not write execution log to "
+            f"{get_log_file_path()}: {log_file_error}",
+        )
 
     directory: Path = args.directory
     if not directory.is_dir():
+        structlog.get_logger(__name__).error(
+            "invalid_directory",
+            directory=str(directory),
+        )
         err_console.print(f"[red]error:[/] not a directory: {directory}")
         return EXIT_BAD_USAGE
 

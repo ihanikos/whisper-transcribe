@@ -8,6 +8,7 @@ Batch-transcribes .mp3/.MP3 files via the local whisper.cpp server.
 - `client.py` — thin httpx wrapper for the `/inference` endpoint
 - `core.py` — orchestration: find, skip, transcribe, write
 - `__main__.py` — argparse CLI + rich summary table
+- `logging_config.py` — stderr logging and rotating JSONL execution log
 
 ## Key invariant
 
@@ -16,6 +17,13 @@ Batch-transcribes .mp3/.MP3 files via the local whisper.cpp server.
 ffmpeg streams PCM audio to stdout; the bytes are patched in memory
 (`_finalize_wav`) and posted directly to the whisper server. Only the
 transcript output file (`.vtt`, `.srt`, etc.) is ever written.
+
+## Execution logs
+
+The CLI writes structured JSON Lines logs to the per-user log directory chosen
+by `platformdirs`. Run `whisper-transcribe --help` to see the resolved path.
+See [docs/structured-logging.md](docs/structured-logging.md) for the format,
+rotation policy, retention, and error lookup command.
 
 ## Dev commands
 
